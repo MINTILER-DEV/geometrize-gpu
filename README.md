@@ -26,6 +26,23 @@ Refer to the minimal [example](https://github.com/Tw1ddle/geometrize-lib-example
 
 See the [top level repo](https://github.com/Tw1ddle/geometrize-top-level-repo) for a listing of all the repositories included in the Geometrize project.
 
+## GPU Candidate Evaluation (Experimental)
+
+This repository includes an optional OpenGL compute path for candidate scoring:
+
+- `geometrize/geometrize/gpu/GpuEvaluator.*`
+- `shaders/evaluate_shapes.comp`
+- `shaders/error_reduce.comp`
+
+The GPU path accelerates candidate rasterization/error scoring and only reads back the reduced best candidate.
+
+Enable at build time with `GEOMETRIZE_ENABLE_OPENGL_COMPUTE`.
+
+Fallback behavior:
+
+- If OpenGL 4.3 compute is unavailable, Geometrize logs a message and uses CPU evaluation.
+- If unsupported shape types are encountered (`line`, `polyline`, `quadratic_bezier`), Geometrize uses CPU evaluation for that step.
+
 ## Shape Comparison
 
 The matrix below shows typical results for a combination of circles, triangles, rotated rectangles, rotated ellipses and all supported shapes at 50, 200 and 500 total shapes:

@@ -9,11 +9,13 @@
 #include <future>
 #include <iostream>
 #include <memory>
+#include <thread>
 #include <vector>
 
 #include "bitmap/bitmap.h"
 #include "commonutil.h"
 #include "core.h"
+#include "gpu/GpuEvaluator.h"
 #include "rasterizer/rasterizer.h"
 #include "shape/shape.h"
 #include "shaperesult.h"
@@ -33,6 +35,79 @@ bool defaultAddShapePrecondition(
     const geometrize::Bitmap&)
 {
     return newScore < lastScore; // Adds the shape if the score improved (that is: the difference decreased)
+}
+
+bool bestRandomStateGpu(
+    const std::function<std::shared_ptr<geometrize::Shape>(void)>& shapeCreator,
+    const std::uint8_t alpha,
+    const std::uint32_t shapeCount,
+    const geometrize::Bitmap& target,
+    const geometrize::Bitmap& current,
+    const double lastScore,
+    geometrize::gpu::GpuEvaluator& evaluator,
+    geometrize::State& outState)
+{
+    std::vector<geometrize::State> candidates;
+    candidates.reserve(shapeCount + 1U);
+    for(std::uint32_t i = 0; i <= shapeCount; i++) {
+        candidates.emplace_back(shapeCreator(), alpha);
+    }
+
+    geometrize::gpu::BatchEvaluationResult result;
+    if(!evaluator.evaluateBestCandidate(target, current, candidates, lastScore, result)) {
+        return false;
+    }
+    if(result.bestIndex >= candidates.size()) {
+        return false;
+    }
+
+    outState = candidates[result.bestIndex];
+    outState.m_score = result.bestScore;
+    return true;
+}
+
+bool bestHillClimbStateGpu(
+    const std::function<std::shared_ptr<geometrize::Shape>(void)>& shapeCreator,
+    const std::uint8_t alpha,
+    const std::uint32_t shapeCount,
+    const std::uint32_t maxShapeMutations,
+    const geometrize::Bitmap& target,
+    const geometrize::Bitmap& current,
+    const double lastScore,
+    geometrize::gpu::GpuEvaluator& evaluator,
+    geometrize::State& outState)
+{
+    geometrize::State state;
+    if(!bestRandomStateGpu(shapeCreator, alpha, shapeCount, target, current, lastScore, evaluator, state)) {
+        return false;
+    }
+
+    geometrize::State bestState(state);
+    double bestEnergy{bestState.m_score};
+
+    std::uint32_t age{0U};
+    while(age < maxShapeMutations) {
+        const geometrize::State undo{state.mutate()};
+        const std::vector<geometrize::State> candidates{state};
+
+        geometrize::gpu::BatchEvaluationResult result;
+        if(!evaluator.evaluateBestCandidate(target, current, candidates, lastScore, result)) {
+            return false;
+        }
+
+        state.m_score = result.bestScore;
+        if(state.m_score >= bestEnergy) {
+            state = undo;
+        } else {
+            bestEnergy = state.m_score;
+            bestState = state;
+            age = static_cast<std::uint32_t>(-1);
+        }
+        age++;
+    }
+
+    outState = bestState;
+    return true;
 }
 
 }
@@ -99,9 +174,29 @@ public:
             }
         }
 
-        std::vector<std::future<geometrize::State>> futures{maxThreads};
+        std::vector<std::uint32_t> randomSeeds;
+        randomSeeds.reserve(maxThreads);
+        for(std::uint32_t i = 0; i < maxThreads; i++) {
+            randomSeeds.push_back(m_baseRandomSeed + m_randomSeedOffset++);
+        }
+
+        if(!energyFunction) {
+            const std::vector<geometrize::State> gpuStates{
+                getHillClimbStateGpu(shapeCreator, alpha, shapeCount, maxShapeMutations, randomSeeds)
+            };
+            if(!gpuStates.empty()) {
+                return gpuStates;
+            }
+            if(!m_loggedGpuFallbackReason) {
+                std::cout << "GPU evaluator unavailable, falling back to CPU: " << m_gpuEvaluator.statusMessage() << std::endl;
+                m_loggedGpuFallbackReason = true;
+            }
+        }
+
+        std::vector<std::future<geometrize::State>> futures{randomSeeds.size()};
         for(std::uint32_t i = 0; i < futures.size(); i++) {
-            std::future<geometrize::State> handle{std::async(std::launch::async, [&](const std::uint32_t seed, const double lastScore) {
+            const std::uint32_t seed{randomSeeds[i]};
+            std::future<geometrize::State> handle{std::async(std::launch::async, [&, seed](const double lastScore) {
                 // Ensure that the results of the random generation are the same between tasks with identical settings
                 // The RNG is thread-local and std::async may use a thread pool (which is why this is necessary)
                 // Note this implementation requires maxThreads to be the same between tasks for each task to produce the same results.
@@ -109,7 +204,7 @@ public:
 
                 geometrize::Bitmap buffer{m_current};
                 return core::bestHillClimbState(shapeCreator, alpha, shapeCount, maxShapeMutations, m_target, m_current, buffer, lastScore, energyFunction);
-            }, m_baseRandomSeed + m_randomSeedOffset++, m_lastScore)};
+            }, m_lastScore)};
             futures[i] = std::move(handle);
         }
 
@@ -126,6 +221,29 @@ public:
                 assert(0 && "Encountered exception when getting hill climb state");
                 throw;
             }
+        }
+        return states;
+    }
+
+    std::vector<geometrize::State> getHillClimbStateGpu(
+            const std::function<std::shared_ptr<geometrize::Shape>(void)> shapeCreator,
+            const std::uint8_t alpha,
+            const std::uint32_t shapeCount,
+            const std::uint32_t maxShapeMutations,
+            const std::vector<std::uint32_t>& randomSeeds)
+    {
+        std::vector<geometrize::State> states;
+        states.reserve(randomSeeds.size());
+
+        for(const std::uint32_t seed : randomSeeds) {
+            geometrize::commonutil::seedRandomGenerator(seed);
+
+            geometrize::State state;
+            if(!bestHillClimbStateGpu(shapeCreator, alpha, shapeCount, maxShapeMutations, m_target, m_current, m_lastScore, m_gpuEvaluator, state)) {
+                return {};
+            }
+
+            states.emplace_back(state);
         }
         return states;
     }
@@ -216,6 +334,8 @@ private:
     const static std::uint32_t defaultMaxThreads{4};
     std::atomic<std::uint32_t> m_baseRandomSeed; ///< The base value used for seeding the random number generator (the one the user has control over).
     std::atomic<std::uint32_t> m_randomSeedOffset; ///< Seed used for random number generation. Note: incremented by each std::async call used for model stepping.
+    geometrize::gpu::GpuEvaluator m_gpuEvaluator; ///< Optional GPU candidate evaluator.
+    bool m_loggedGpuFallbackReason{false}; ///< Whether a GPU fallback reason was logged.
 };
 
 Model::Model(const geometrize::Bitmap& target) : d{std::unique_ptr<Model::ModelImpl>(new Model::ModelImpl(target))}
