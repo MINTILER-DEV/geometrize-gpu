@@ -1,0 +1,59 @@
+#version 430
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer ScoreBuffer {
+    float scores[];
+};
+
+struct ReductionResult {
+    uint bestIndex;
+    float bestScore;
+    uint reserved0;
+    uint reserved1;
+};
+
+layout(std430, binding = 1) writeonly buffer ResultBuffer {
+    ReductionResult result;
+};
+
+uniform uint uCandidateCount;
+
+shared float sBestScore[256];
+shared uint sBestIndex[256];
+
+void main()
+{
+    uint tid = gl_LocalInvocationID.x;
+
+    float bestScore = 1e30;
+    uint bestIndex = 0U;
+
+    for(uint i = tid; i < uCandidateCount; i += 256U) {
+        float score = scores[i];
+        if(score < bestScore) {
+            bestScore = score;
+            bestIndex = i;
+        }
+    }
+
+    sBestScore[tid] = bestScore;
+    sBestIndex[tid] = bestIndex;
+    barrier();
+
+    for(uint stride = 128U; stride > 0U; stride >>= 1U) {
+        if(tid < stride) {
+            float otherScore = sBestScore[tid + stride];
+            uint otherIndex = sBestIndex[tid + stride];
+            if(otherScore < sBestScore[tid]) {
+                sBestScore[tid] = otherScore;
+                sBestIndex[tid] = otherIndex;
+            }
+        }
+        barrier();
+    }
+
+    if(tid == 0U) {
+        result.bestIndex = sBestIndex[0];
+        result.bestScore = sBestScore[0];
+    }
+}
