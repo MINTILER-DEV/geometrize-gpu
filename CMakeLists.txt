@@ -10,7 +10,7 @@ file(GLOB_RECURSE GEOMETRIZE_SOURCES CONFIGURE_DEPENDS
 
 add_library(geometrize STATIC ${GEOMETRIZE_HEADERS} ${GEOMETRIZE_SOURCES})
 target_include_directories(geometrize PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/geometrize")
-target_compile_features(geometrize PUBLIC cxx_std_14)
+target_compile_features(geometrize PUBLIC cxx_std_17)
 
 if(GEOMETRIZE_ENABLE_OPENGL_COMPUTE)
     find_package(OpenGL REQUIRED)
